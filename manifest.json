@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "id": "kcodedev.urchin",
+  "name": "Urchin Keyboard",
+  "version": "0.1.0",
+  "author": "kcodedev",
+  "license": "MIT",
+  "description": "Visual ZMK keymap editing, local firmware builds, and guided flashing for the Urchin keyboard.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Urchin Keyboard",
+    "description": "Edit, build, and flash an Urchin ZMK keyboard from the Omarchy bar.",
+    "category": "Hardware",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "repoPath": "/home/kob/Repos/zmk-urchin-kcodedev",
+      "keymapPath": "config/urchin.keymap",
+      "layoutPath": "config/urchin.json"
+    },
+    "schema": [
+      {
+        "key": "repoPath",
+        "type": "path",
+        "label": "ZMK config repository",
+        "defaultValue": "/home/kob/Repos/zmk-urchin-kcodedev"
+      },
+      {
+        "key": "keymapPath",
+        "type": "string",
+        "label": "Keymap path",
+        "defaultValue": "config/urchin.keymap"
+      },
+      {
+        "key": "layoutPath",
+        "type": "string",
+        "label": "Physical layout path",
+        "defaultValue": "config/urchin.json"
+      }
+    ]
+  }
+}

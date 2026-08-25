@@ -1,0 +1,569 @@
+#!/usr/bin/env python3
+"""Local control plane for the Urchin Omarchy plugin.
+
+The CLI intentionally exposes a small, argv-only command surface so the QML
+plugin never has to construct shell programs from user-controlled values.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from typing import Any, Iterable
+
+
+DEFAULT_REPO = Path("/home/kob/Repos/zmk-urchin-kcodedev")
+DEFAULT_KEYMAP = Path("config/urchin.keymap")
+DEFAULT_LAYOUT = Path("config/urchin.json")
+DEFAULT_IMAGE = "zmkfirmware/zmk-build-arm@sha256:edb1c953438c6f720ddb79c3762f3972013b7fbbaf4fff3592fc869983e7afc5"
+STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "urchin-manager"
+CACHE_HOME = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "urchin-manager"
+
+
+class UrchinError(RuntimeError):
+    pass
+
+
+def emit_json(value: Any) -> None:
+    print(json.dumps(value, separators=(",", ":"), ensure_ascii=False))
+
+
+def safe_repo_path(repo: Path, relative: Path) -> Path:
+    repo = repo.expanduser().resolve()
+    candidate = (repo / relative).resolve()
+    if candidate != repo and repo not in candidate.parents:
+        raise UrchinError(f"Path escapes repository: {relative}")
+    return candidate
+
+
+def mask_comments_and_strings(text: str, *, keep_strings: bool = True) -> str:
+    """Replace comments with spaces while retaining offsets and newlines."""
+    chars = list(text)
+    i = 0
+    state = "code"
+    quote = ""
+    while i < len(chars):
+        ch = chars[i]
+        nxt = chars[i + 1] if i + 1 < len(chars) else ""
+        if state == "code":
+            if ch == "/" and nxt == "/":
+                chars[i] = chars[i + 1] = " "
+                state = "line"
+                i += 2
+                continue
+            if ch == "/" and nxt == "*":
+                chars[i] = chars[i + 1] = " "
+                state = "block"
+                i += 2
+                continue
+            if ch in ('"', "'"):
+                quote = ch
+                if not keep_strings:
+                    chars[i] = " "
+                state = "string"
+            i += 1
+            continue
+        if state == "line":
+            if ch == "\n":
+                state = "code"
+            else:
+                chars[i] = " "
+            i += 1
+            continue
+        if state == "block":
+            if ch == "*" and nxt == "/":
+                chars[i] = chars[i + 1] = " "
+                state = "code"
+                i += 2
+            else:
+                if ch != "\n":
+                    chars[i] = " "
+                i += 1
+            continue
+        if state == "string":
+            if not keep_strings and ch != "\n":
+                chars[i] = " "
+            if ch == "\\" and i + 1 < len(chars):
+                if not keep_strings:
+                    chars[i + 1] = " "
+                i += 2
+                continue
+            if ch == quote:
+                state = "code"
+            i += 1
+    return "".join(chars)
+
+
+def matching_brace(masked: str, opening: int) -> int:
+    depth = 0
+    for pos in range(opening, len(masked)):
+        if masked[pos] == "{":
+            depth += 1
+        elif masked[pos] == "}":
+            depth -= 1
+            if depth == 0:
+                return pos
+    raise UrchinError("Unbalanced braces in keymap")
+
+
+def direct_child_nodes(text: str, body_start: int, body_end: int) -> Iterable[tuple[str, int, int]]:
+    masked = mask_comments_and_strings(text, keep_strings=False)
+    depth = 0
+    i = body_start
+    while i < body_end:
+        ch = masked[i]
+        if ch == "{":
+            if depth == 0:
+                prefix = masked[max(body_start, i - 120) : i]
+                found = re.search(r"([A-Za-z_][A-Za-z0-9_-]*)\s*$", prefix)
+                close = matching_brace(masked, i)
+                if found:
+                    yield found.group(1), i + 1, close
+                i = close + 1
+                continue
+            depth += 1
+        elif ch == "}":
+            depth = max(0, depth - 1)
+        i += 1
+
+
+def find_keymap_body(text: str) -> tuple[int, int]:
+    masked = mask_comments_and_strings(text, keep_strings=False)
+    found = re.search(r"\bkeymap\s*\{", masked)
+    if not found:
+        raise UrchinError("Could not find keymap node")
+    opening = masked.find("{", found.start())
+    return opening + 1, matching_brace(masked, opening)
+
+
+def binding_ranges(text: str, start: int, end: int) -> list[tuple[int, int]]:
+    masked = mask_comments_and_strings(text)
+    starts = [m.start() for m in re.finditer(r"&[A-Za-z_][A-Za-z0-9_]*", masked[start:end])]
+    starts = [start + value for value in starts]
+    ranges: list[tuple[int, int]] = []
+    for index, item_start in enumerate(starts):
+        candidate_end = starts[index + 1] if index + 1 < len(starts) else end
+        clean_segment = masked[item_start:candidate_end].rstrip()
+        ranges.append((item_start, item_start + len(clean_segment)))
+    return ranges
+
+
+def parse_layers(text: str) -> list[dict[str, Any]]:
+    keymap_start, keymap_end = find_keymap_body(text)
+    masked = mask_comments_and_strings(text)
+    layers: list[dict[str, Any]] = []
+    for node, node_start, node_end in direct_child_nodes(text, keymap_start, keymap_end):
+        body = text[node_start:node_end]
+        label_match = re.search(r'\blabel\s*=\s*"([^"]+)"\s*;', body)
+        bindings_match = re.search(r"\bbindings\s*=\s*<", mask_comments_and_strings(body))
+        if not label_match or not bindings_match:
+            continue
+        angle_start = node_start + bindings_match.end()
+        angle_end = masked.find(">;", angle_start, node_end)
+        if angle_end < 0:
+            raise UrchinError(f"Unterminated bindings array in layer {node}")
+        ranges = binding_ranges(text, angle_start, angle_end)
+        layers.append(
+            {
+                "node": node,
+                "label": label_match.group(1),
+                "bindings": [" ".join(text[a:b].split()) for a, b in ranges],
+                "_ranges": ranges,
+            }
+        )
+    if not layers:
+        raise UrchinError("No labelled keymap layers found")
+    return layers
+
+
+def public_layers(layers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{key: value for key, value in layer.items() if not key.startswith("_")} for layer in layers]
+
+
+def validate_binding(value: str) -> str:
+    value = " ".join(value.strip().split())
+    if not value.startswith("&"):
+        raise UrchinError("A binding must start with '&'")
+    if len(value) > 160 or not re.fullmatch(r"[&A-Za-z0-9_()+,.-]+(?:\s+[&A-Za-z0-9_()+,.-]+)*", value):
+        raise UrchinError("Binding contains unsupported characters")
+    return value
+
+
+def choose_layer(layers: list[dict[str, Any]], selector: str) -> dict[str, Any]:
+    if selector.isdigit():
+        index = int(selector)
+        if 0 <= index < len(layers):
+            return layers[index]
+    for layer in layers:
+        if selector in (layer["node"], layer["label"]):
+            return layer
+    raise UrchinError(f"Unknown layer: {selector}")
+
+
+def atomic_replace(path: Path, content: str) -> None:
+    stat = path.stat()
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+        handle.write(content)
+        temp_path = Path(handle.name)
+    os.chmod(temp_path, stat.st_mode)
+    os.replace(temp_path, path)
+
+
+def load_layout(path: Path) -> list[dict[str, Any]]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return list(data["layouts"]["default_transform"]["layout"])
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise UrchinError(f"Could not read physical layout {path}: {exc}") from exc
+
+
+def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=check,
+    )
+
+
+def latest_artifacts() -> list[dict[str, Any]]:
+    artifact_root = STATE_HOME / "artifacts"
+    if not artifact_root.exists():
+        return []
+    items: list[dict[str, Any]] = []
+    for path in artifact_root.glob("*.uf2"):
+        stat = path.stat()
+        items.append({"name": path.name, "path": str(path), "mtime": int(stat.st_mtime), "size": stat.st_size})
+    return sorted(items, key=lambda item: item["mtime"], reverse=True)
+
+
+def docker_ready() -> tuple[bool, str]:
+    if not shutil.which("docker"):
+        return False, "Docker is not installed"
+    try:
+        proc = subprocess.run(
+            ["docker", "info", "--format", "{{.ServerVersion}}"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=4,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"Docker is unavailable: {exc}"
+    if proc.returncode != 0:
+        detail = proc.stderr.strip().splitlines()
+        return False, detail[-1] if detail else "Docker daemon is not running"
+    return True, proc.stdout.strip()
+
+
+def snapshot(repo: Path, keymap_rel: Path, layout_rel: Path) -> dict[str, Any]:
+    keymap = safe_repo_path(repo, keymap_rel)
+    layout = safe_repo_path(repo, layout_rel)
+    errors: list[str] = []
+    layers: list[dict[str, Any]] = []
+    positions: list[dict[str, Any]] = []
+    if not repo.is_dir():
+        errors.append(f"Repository does not exist: {repo}")
+    else:
+        try:
+            layers = public_layers(parse_layers(keymap.read_text(encoding="utf-8")))
+        except (OSError, UrchinError) as exc:
+            errors.append(str(exc))
+        try:
+            positions = load_layout(layout)
+        except UrchinError as exc:
+            errors.append(str(exc))
+    dirty = False
+    branch = ""
+    if (repo / ".git").exists():
+        status = git(repo, "status", "--porcelain", check=False)
+        dirty = bool(status.stdout.strip())
+        branch_proc = git(repo, "branch", "--show-current", check=False)
+        branch = branch_proc.stdout.strip()
+    ready, docker_detail = docker_ready()
+    return {
+        "ok": not errors,
+        "repo": str(repo),
+        "keymap": str(keymap),
+        "branch": branch,
+        "dirty": dirty,
+        "docker": {"ready": ready, "detail": docker_detail},
+        "layers": layers,
+        "layout": positions,
+        "artifacts": latest_artifacts(),
+        "errors": errors,
+    }
+
+
+def parse_build_matrix(path: Path) -> list[dict[str, str]]:
+    """Parse the scalar-only `include` matrix used by ZMK config repos."""
+    entries: list[dict[str, str]] = []
+    current: dict[str, str] | None = None
+    in_include = False
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        stripped = line.strip()
+        if indent == 0:
+            if stripped == "include:":
+                in_include = True
+                continue
+            if in_include:
+                break
+        if not in_include:
+            continue
+        if stripped.startswith("- "):
+            if current:
+                entries.append(current)
+            current = {}
+            stripped = stripped[2:].strip()
+        if current is None or ":" not in stripped:
+            continue
+        key, value = stripped.split(":", 1)
+        current[key.strip()] = value.strip().strip('"\'')
+    if current:
+        entries.append(current)
+    if not entries:
+        raise UrchinError(f"No include entries found in {path}")
+    return entries
+
+
+def target_name(entry: dict[str, str]) -> str:
+    shield = entry.get("shield", "").split()
+    primary = shield[0] if shield else entry.get("board", "firmware")
+    if primary.endswith("_left"):
+        return "left"
+    if primary.endswith("_right"):
+        return "right"
+    if primary == "settings_reset":
+        return "reset"
+    return primary.replace("_", "-")
+
+
+def run_stream(command: list[str], cwd: Path | None = None) -> None:
+    proc = subprocess.Popen(command, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        print(line.rstrip(), flush=True)
+    code = proc.wait()
+    if code != 0:
+        raise UrchinError(f"Command failed with exit code {code}: {' '.join(command[:3])}")
+
+
+def sync_config(repo: Path, workspace: Path) -> None:
+    source = safe_repo_path(repo, Path("config"))
+    destination = workspace / "config"
+    if destination.exists():
+        shutil.rmtree(destination)
+    shutil.copytree(source, destination)
+
+
+def docker_command(workspace: Path, args: list[str]) -> list[str]:
+    image = os.environ.get("URCHIN_ZMK_IMAGE", DEFAULT_IMAGE)
+    return [
+        "docker", "run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}",
+        "-e", "HOME=/tmp/urchin-home",
+        "-e", "CMAKE_PREFIX_PATH=/workspace/zephyr",
+        "-w", "/workspace",
+        "-v", f"{workspace}:/workspace", image, *args,
+    ]
+
+
+def manifest_digest(repo: Path) -> str:
+    digest = hashlib.sha256()
+    for relative in (Path("config/west.yml"), Path("build.yaml")):
+        digest.update(safe_repo_path(repo, relative).read_bytes())
+    return digest.hexdigest()
+
+
+def prepare_workspace(repo: Path, workspace: Path, force_update: bool) -> None:
+    workspace.mkdir(parents=True, exist_ok=True)
+    sync_config(repo, workspace)
+    current_digest = manifest_digest(repo)
+    digest_path = workspace / ".urchin-manifest-digest"
+    previous_digest = digest_path.read_text().strip() if digest_path.exists() else ""
+    needs_init = not (workspace / ".west").exists()
+    needs_update = force_update or needs_init or current_digest != previous_digest or not (workspace / "zmk").exists()
+    if needs_init:
+        print("[setup] Initializing the cached ZMK workspace", flush=True)
+        run_stream(docker_command(workspace, ["west", "init", "-l", "config"]))
+    if needs_update:
+        print("[setup] Fetching ZMK and module dependencies", flush=True)
+        run_stream(docker_command(workspace, ["west", "update", "--fetch-opt=--filter=tree:0"]))
+        digest_path.write_text(current_digest, encoding="utf-8")
+
+
+def build_one(repo: Path, entry: dict[str, str], force_update: bool) -> Path:
+    ready, detail = docker_ready()
+    if not ready:
+        raise UrchinError(detail)
+    workspace = CACHE_HOME / "workspace"
+    prepare_workspace(repo, workspace, force_update)
+    name = target_name(entry)
+    build_dir = f"build/{name}"
+    args = ["west", "build", "-p", "auto", "-s", "zmk/app", "-d", build_dir, "-b", entry["board"]]
+    snippet = entry.get("snippet", "")
+    if snippet:
+        args.extend(["-S", snippet])
+    cmake = ["--", "-DZMK_CONFIG=/workspace/config"]
+    if entry.get("shield"):
+        cmake.append(f"-DSHIELD={entry['shield']}")
+    if entry.get("cmake-args"):
+        cmake.extend(entry["cmake-args"].split())
+    print(f"[build] Building {name}", flush=True)
+    run_stream(docker_command(workspace, args + cmake))
+    source = workspace / build_dir / "zephyr" / "zmk.uf2"
+    if not source.exists():
+        raise UrchinError(f"Build completed without producing {source}")
+    STATE_HOME.joinpath("artifacts").mkdir(parents=True, exist_ok=True)
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    destination = STATE_HOME / "artifacts" / f"urchin-{name}-{stamp}.uf2"
+    shutil.copy2(source, destination)
+    latest = STATE_HOME / "artifacts" / f"urchin-{name}-latest.uf2"
+    shutil.copy2(source, latest)
+    print(f"[done] {destination}", flush=True)
+    return destination
+
+
+def select_targets(entries: list[dict[str, str]], selector: str) -> list[dict[str, str]]:
+    if selector == "all":
+        return [entry for entry in entries if target_name(entry) in ("left", "right")]
+    chosen = [entry for entry in entries if target_name(entry) == selector]
+    if not chosen:
+        raise UrchinError(f"No '{selector}' target in build.yaml")
+    return chosen
+
+
+def mounted_nicenano() -> Path | None:
+    proc = subprocess.run(
+        ["lsblk", "-J", "-o", "LABEL,MOUNTPOINTS"],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+    if proc.returncode != 0:
+        raise UrchinError(proc.stderr.strip() or "lsblk failed")
+    data = json.loads(proc.stdout)
+
+    def walk(devices: list[dict[str, Any]]) -> Path | None:
+        for device in devices:
+            if str(device.get("label") or "").upper() == "NICENANO":
+                for mount in device.get("mountpoints") or []:
+                    if mount:
+                        path = Path(mount).resolve()
+                        if path.is_dir() and path != Path("/"):
+                            return path
+            found = walk(device.get("children") or [])
+            if found:
+                return found
+        return None
+
+    return walk(data.get("blockdevices") or [])
+
+
+def artifact_for_target(selector: str) -> Path:
+    path = STATE_HOME / "artifacts" / f"urchin-{selector}-latest.uf2"
+    if not path.is_file():
+        raise UrchinError(f"No {selector} artifact found. Build it first.")
+    return path
+
+
+def command_snapshot(args: argparse.Namespace) -> None:
+    emit_json(snapshot(args.repo, args.keymap, args.layout))
+
+
+def command_set_binding(args: argparse.Namespace) -> None:
+    path = safe_repo_path(args.repo, args.keymap)
+    text = path.read_text(encoding="utf-8")
+    layers = parse_layers(text)
+    layer = choose_layer(layers, args.layer)
+    if args.position < 0 or args.position >= len(layer["_ranges"]):
+        raise UrchinError(f"Position must be between 0 and {len(layer['_ranges']) - 1}")
+    value = validate_binding(args.binding)
+    start, end = layer["_ranges"][args.position]
+    previous = " ".join(text[start:end].split())
+    if previous != value:
+        atomic_replace(path, text[:start] + value + text[end:])
+    emit_json({"ok": True, "layer": layer["label"], "position": args.position, "before": previous, "after": value})
+
+
+def command_diff(args: argparse.Namespace) -> None:
+    relative = str(args.keymap)
+    proc = git(args.repo, "diff", "--", relative, check=False)
+    emit_json({"ok": proc.returncode == 0, "diff": proc.stdout, "error": proc.stderr.strip()})
+
+
+def command_build(args: argparse.Namespace) -> None:
+    matrix = parse_build_matrix(safe_repo_path(args.repo, Path("build.yaml")))
+    outputs = [str(build_one(args.repo, entry, args.update)) for entry in select_targets(matrix, args.target)]
+    print("URCHIN_RESULT:" + json.dumps({"ok": True, "artifacts": outputs}), flush=True)
+
+
+def command_flash(args: argparse.Namespace) -> None:
+    artifact = artifact_for_target(args.target)
+    deadline = time.monotonic() + args.timeout
+    print(f"[flash] Waiting for NICENANO to mount for the {args.target} half", flush=True)
+    mount = mounted_nicenano()
+    while mount is None and time.monotonic() < deadline:
+        time.sleep(0.5)
+        mount = mounted_nicenano()
+    if mount is None:
+        raise UrchinError("NICENANO was not mounted. Enter bootloader mode and try again.")
+    destination = mount / artifact.name
+    print(f"[flash] Copying {artifact.name} to {mount}", flush=True)
+    shutil.copyfile(artifact, destination)
+    os.sync()
+    print("[done] Firmware copied; the controller should reboot automatically", flush=True)
+    print("URCHIN_RESULT:" + json.dumps({"ok": True, "artifact": str(artifact), "mount": str(mount)}), flush=True)
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(prog="urchinctl", description="Manage an Urchin ZMK keyboard locally")
+    result.add_argument("--repo", type=Path, default=Path(os.environ.get("URCHIN_ZMK_REPO", DEFAULT_REPO)))
+    result.add_argument("--keymap", type=Path, default=DEFAULT_KEYMAP)
+    result.add_argument("--layout", type=Path, default=DEFAULT_LAYOUT)
+    sub = result.add_subparsers(dest="command", required=True)
+    snapshot_cmd = sub.add_parser("snapshot", help="Print plugin state as JSON")
+    snapshot_cmd.set_defaults(func=command_snapshot)
+    edit_cmd = sub.add_parser("set-binding", help="Replace one key binding")
+    edit_cmd.add_argument("--layer", required=True)
+    edit_cmd.add_argument("--position", required=True, type=int)
+    edit_cmd.add_argument("--binding", required=True)
+    edit_cmd.set_defaults(func=command_set_binding)
+    diff_cmd = sub.add_parser("diff", help="Print the keymap's Git diff as JSON")
+    diff_cmd.set_defaults(func=command_diff)
+    build_cmd = sub.add_parser("build", help="Build firmware in a cached Docker workspace")
+    build_cmd.add_argument("target", choices=("left", "right", "reset", "all"))
+    build_cmd.add_argument("--update", action="store_true", help="Force west update")
+    build_cmd.set_defaults(func=command_build)
+    flash_cmd = sub.add_parser("flash", help="Wait for NICENANO and copy the latest firmware")
+    flash_cmd.add_argument("target", choices=("left", "right", "reset"))
+    flash_cmd.add_argument("--timeout", type=int, default=60)
+    flash_cmd.set_defaults(func=command_flash)
+    return result
+
+
+def main() -> int:
+    args = parser().parse_args()
+    args.repo = args.repo.expanduser().resolve()
+    try:
+        args.func(args)
+        return 0
+    except (UrchinError, OSError, ValueError, subprocess.SubprocessError) as exc:
+        print(f"error: {exc}", file=sys.stderr, flush=True)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
