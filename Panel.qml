@@ -19,6 +19,9 @@ Panel {
   readonly property color accent: Color.accent
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property color surface: Color.popups.background
+  readonly property color diffAddition: "#8fbc8f"
+  readonly property color diffDeletion: bar ? bar.urgent : Color.urgent
+  readonly property color diffHunk: accent
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
   readonly property string repoPath: String(setting("repoPath", "/home/kob/Repos/zmk-urchin-kcodedev"))
@@ -89,6 +92,42 @@ Panel {
       return held + "\n" + tapped
     }
     return value.replace("&", "")
+  }
+
+  function diffHtml(diff) {
+    var lines = String(diff || "").split("\n")
+    var html = ""
+    for (var index = 0; index < lines.length; index++) {
+      var line = lines[index]
+      var color = root.foreground
+      var bold = false
+
+      if (line.indexOf("diff --git ") === 0) {
+        color = root.diffHunk
+        bold = true
+      } else if (line.indexOf("@@") === 0) {
+        color = root.diffHunk
+        bold = true
+      } else if (line.indexOf("+++") === 0 || (line.length > 0 && line[0] === "+")) {
+        color = root.diffAddition
+      } else if (line.indexOf("---") === 0 || (line.length > 0 && line[0] === "-")) {
+        color = root.diffDeletion
+      } else if (line.indexOf("index ") === 0) {
+        color = root.dim
+      }
+
+      var escaped = line.replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/\t/g, "    ")
+        .replace(/ /g, "&#160;")
+      if (escaped === "") escaped = "&#160;"
+
+      var content = bold ? "<b>" + escaped + "</b>" : escaped
+      html += "<font color=\"" + String(color) + "\">" + content + "</font>"
+      if (index < lines.length - 1) html += "<br>"
+    }
+    return html
   }
 
   function keyX(index) {
@@ -495,20 +534,23 @@ Panel {
             padding: Style.space(8)
 
             Flickable {
+              id: diffScroll
               anchors.fill: parent
-              contentWidth: width
+              contentWidth: Math.max(width, diffLabel.implicitWidth)
               contentHeight: diffLabel.implicitHeight
               clip: true
               boundsBehavior: Flickable.StopAtBounds
+              ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+              ScrollBar.horizontal: ScrollBar { policy: ScrollBar.AsNeeded }
 
               Text {
                 id: diffLabel
-                width: parent.width
-                text: root.diffText
+                text: root.diffHtml(root.diffText)
+                textFormat: Text.RichText
                 color: root.foreground
                 font.family: "monospace"
                 font.pixelSize: Style.font.caption
-                wrapMode: Text.WrapAnywhere
+                wrapMode: Text.NoWrap
               }
             }
           }
