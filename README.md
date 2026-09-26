@@ -13,6 +13,9 @@ keyboard running ZMK.
 - Keeps the ZMK checkout and build directories cached for incremental builds.
 - Waits for a mounted `NICENANO` bootloader and flashes the selected artifact.
 - Opens ZMK Studio for temporary live experiments.
+- Shows the live left-half battery percentage when hovering over the bar icon.
+  When firmware exposes the split peripheral battery proxy, the tooltip shows
+  both halves.
 
 The ZMK config repository remains the source of truth. The plugin never commits
 or pushes automatically.
@@ -52,6 +55,7 @@ The CLI used by the panel is also available directly:
 
 ```bash
 bin/urchinctl snapshot
+bin/urchinctl battery
 bin/urchinctl build left
 bin/urchinctl build all
 bin/urchinctl flash left

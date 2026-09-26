@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "kcodedev.urchin",
   "name": "Urchin Keyboard",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "kcodedev",
   "license": "MIT",
   "description": "Visual ZMK keymap editing, local firmware builds, and guided flashing for the Urchin keyboard.",

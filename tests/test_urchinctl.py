@@ -87,5 +87,67 @@ include:
         self.assertEqual(urchinctl.target_name(entries[1]), "reset")
 
 
+def prop(type_name, data):
+    return {"type": type_name, "data": data}
+
+
+class BatteryTests(unittest.TestCase):
+    def objects(self, *, connected=True, two_batteries=False):
+        device = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF"
+        result = {
+            device: {
+                "org.bluez.Device1": {
+                    "Name": prop("s", "urchin"),
+                    "Alias": prop("s", "Urchin"),
+                    "Connected": prop("b", connected),
+                    "Paired": prop("b", True),
+                }
+            },
+            device + "/service0010": {
+                "org.bluez.GattService1": {"UUID": prop("s", urchinctl.BLUEZ_BATTERY_SERVICE_UUID)}
+            },
+            device + "/service0010/char0011": {
+                "org.bluez.GattCharacteristic1": {
+                    "UUID": prop("s", urchinctl.BLUEZ_BATTERY_LEVEL_UUID),
+                    "Service": prop("o", device + "/service0010"),
+                    "Handle": prop("q", 17),
+                }
+            },
+        }
+        if two_batteries:
+            result[device + "/service0015"] = {
+                "org.bluez.GattService1": {"UUID": prop("s", urchinctl.BLUEZ_BATTERY_SERVICE_UUID)}
+            }
+            result[device + "/service0015/char0016"] = {
+                "org.bluez.GattCharacteristic1": {
+                    "UUID": prop("s", urchinctl.BLUEZ_BATTERY_LEVEL_UUID),
+                    "Service": prop("o", device + "/service0015"),
+                    "Handle": prop("q", 22),
+                }
+            }
+        return result
+
+    def test_reads_left_battery(self):
+        status = urchinctl.battery_status_from_objects(self.objects(), "urchin", lambda _path: 91)
+        self.assertEqual(status["left"], 91)
+        self.assertIsNone(status["right"])
+        self.assertTrue(status["connected"])
+
+    def test_maps_battery_services_by_handle_to_left_and_right(self):
+        values = iter((91, 74))
+        status = urchinctl.battery_status_from_objects(
+            self.objects(two_batteries=True), "urchin", lambda _path: next(values)
+        )
+        self.assertEqual(status["levels"], [91, 74])
+        self.assertEqual((status["left"], status["right"]), (91, 74))
+
+    def test_does_not_read_stale_values_while_disconnected(self):
+        status = urchinctl.battery_status_from_objects(
+            self.objects(connected=False), "urchin", lambda _path: self.fail("reader called")
+        )
+        self.assertFalse(status["connected"])
+        self.assertEqual(status["levels"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

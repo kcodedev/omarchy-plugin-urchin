@@ -28,6 +28,9 @@ DEFAULT_LAYOUT = Path("config/urchin.json")
 DEFAULT_IMAGE = "zmkfirmware/zmk-build-arm@sha256:edb1c953438c6f720ddb79c3762f3972013b7fbbaf4fff3592fc869983e7afc5"
 STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "urchin-manager"
 CACHE_HOME = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "urchin-manager"
+BLUEZ_DESTINATION = "org.bluez"
+BLUEZ_BATTERY_SERVICE_UUID = "0000180f-0000-1000-8000-00805f9b34fb"
+BLUEZ_BATTERY_LEVEL_UUID = "00002a19-0000-1000-8000-00805f9b34fb"
 
 
 class UrchinError(RuntimeError):
@@ -36,6 +39,107 @@ class UrchinError(RuntimeError):
 
 def emit_json(value: Any) -> None:
     print(json.dumps(value, separators=(",", ":"), ensure_ascii=False))
+
+
+def dbus_value(value: Any, default: Any = None) -> Any:
+    if not isinstance(value, dict):
+        return default
+    return value.get("data", default)
+
+
+def busctl_json(*args: str) -> dict[str, Any]:
+    try:
+        proc = subprocess.run(
+            ["busctl", "--system", "--json=short", *args],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+        )
+    except FileNotFoundError as exc:
+        raise UrchinError("busctl is required to read the keyboard battery") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise UrchinError("Timed out while reading Bluetooth battery data") from exc
+    if proc.returncode != 0:
+        raise UrchinError(proc.stderr.strip() or "Could not read Bluetooth battery data")
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise UrchinError("BlueZ returned invalid battery data") from exc
+
+
+def read_bluez_battery(characteristic_path: str) -> int:
+    payload = busctl_json(
+        "call", BLUEZ_DESTINATION, characteristic_path,
+        "org.bluez.GattCharacteristic1", "ReadValue", "a{sv}", "0",
+    )
+    data = payload.get("data", [])
+    values = data[0] if data and isinstance(data[0], list) else []
+    if not values or not isinstance(values[0], int) or not 0 <= values[0] <= 100:
+        raise UrchinError("Urchin returned an invalid battery percentage")
+    return values[0]
+
+
+def battery_status_from_objects(
+    objects: dict[str, Any], device_name: str, reader=read_bluez_battery,
+) -> dict[str, Any]:
+    candidates: list[tuple[bool, bool, str, dict[str, Any]]] = []
+    for path, interfaces in objects.items():
+        device = interfaces.get("org.bluez.Device1")
+        if not device:
+            continue
+        names = {str(dbus_value(device.get(key), "")).casefold() for key in ("Name", "Alias")}
+        if device_name.casefold() not in names:
+            continue
+        connected = bool(dbus_value(device.get("Connected"), False))
+        paired = bool(dbus_value(device.get("Paired"), False))
+        candidates.append((connected, paired, path, device))
+
+    if not candidates:
+        return {"ok": True, "found": False, "connected": False, "left": None, "right": None, "levels": []}
+
+    connected, _paired, device_path, _device = max(candidates, key=lambda item: (item[0], item[1]))
+    if not connected:
+        return {
+            "ok": True, "found": True, "connected": False, "devicePath": device_path,
+            "left": None, "right": None, "levels": [],
+        }
+
+    services: set[str] = set()
+    for path, interfaces in objects.items():
+        service = interfaces.get("org.bluez.GattService1")
+        if path.startswith(device_path + "/") and service \
+                and str(dbus_value(service.get("UUID"), "")).casefold() == BLUEZ_BATTERY_SERVICE_UUID:
+            services.add(path)
+
+    characteristics: list[tuple[int, str]] = []
+    for path, interfaces in objects.items():
+        characteristic = interfaces.get("org.bluez.GattCharacteristic1")
+        if not characteristic:
+            continue
+        uuid = str(dbus_value(characteristic.get("UUID"), "")).casefold()
+        service_path = str(dbus_value(characteristic.get("Service"), ""))
+        if uuid == BLUEZ_BATTERY_LEVEL_UUID and service_path in services:
+            handle = int(dbus_value(characteristic.get("Handle"), 0))
+            characteristics.append((handle, path))
+
+    levels = [reader(path) for _handle, path in sorted(characteristics)]
+    return {
+        "ok": True, "found": True, "connected": True, "devicePath": device_path,
+        "left": levels[0] if levels else None,
+        "right": levels[1] if len(levels) > 1 else None,
+        "levels": levels,
+    }
+
+
+def command_battery(args: argparse.Namespace) -> None:
+    payload = busctl_json(
+        "call", BLUEZ_DESTINATION, "/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects",
+    )
+    data = payload.get("data", [])
+    objects = data[0] if data and isinstance(data[0], dict) else {}
+    emit_json(battery_status_from_objects(objects, args.device))
 
 
 def safe_repo_path(repo: Path, relative: Path) -> Path:
@@ -543,6 +647,9 @@ def parser() -> argparse.ArgumentParser:
     edit_cmd.set_defaults(func=command_set_binding)
     diff_cmd = sub.add_parser("diff", help="Print the keymap's Git diff as JSON")
     diff_cmd.set_defaults(func=command_diff)
+    battery_cmd = sub.add_parser("battery", help="Print live Urchin battery levels as JSON")
+    battery_cmd.add_argument("--device", default="urchin", help="Bluetooth device name or alias")
+    battery_cmd.set_defaults(func=command_battery)
     build_cmd = sub.add_parser("build", help="Build firmware in a cached Docker workspace")
     build_cmd.add_argument("target", choices=("left", "right", "reset", "all"))
     build_cmd.add_argument("--update", action="store_true", help="Force west update")
