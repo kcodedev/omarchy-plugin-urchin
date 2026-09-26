@@ -5,6 +5,7 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -147,6 +148,87 @@ class BatteryTests(unittest.TestCase):
         )
         self.assertFalse(status["connected"])
         self.assertEqual(status["levels"], [])
+class LocalBuildTests(unittest.TestCase):
+    def test_cmake_options_changed_between_builds_get_a_clean_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            config = repo / "config"
+            config.mkdir()
+            config.joinpath("urchin.conf").write_text("CONFIG_ZMK_SLEEP=y\n")
+            workspace = root / "cache" / "urchin-manager" / "workspace"
+            commands = []
+
+            def fake_run(command):
+                commands.append(command)
+                config_dir = workspace / "build" / "left" / "zephyr"
+                config_dir.mkdir(parents=True, exist_ok=True)
+                proxy = "-DCONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_PROXY=y" in command
+                config_dir.joinpath(".config").write_text(
+                    "CONFIG_ZMK_STUDIO=y\n" +
+                    ("CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_PROXY=y\n" if proxy else
+                     "# CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_PROXY is not set\n")
+                )
+                config_dir.joinpath("zmk.uf2").write_bytes(b"proxy" if proxy else b"no proxy")
+
+            entry = {"board": "nice_nano_v2", "shield": "urchin_left", "cmake-args": "-DCONFIG_ZMK_STUDIO=y -DCONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_PROXY=y"}
+            with patch.object(urchinctl, "CACHE_HOME", root / "cache" / "urchin-manager"), \
+                 patch.object(urchinctl, "STATE_HOME", root / "state" / "urchin-manager"), \
+                 patch.object(urchinctl, "docker_ready", return_value=(True, "ready")), \
+                 patch.object(urchinctl, "prepare_workspace"), \
+                 patch.object(urchinctl, "run_stream", side_effect=fake_run):
+                urchinctl.build_one(repo, entry, False)
+                urchinctl.build_one(repo, entry, False)
+                entry["cmake-args"] = "-DCONFIG_ZMK_STUDIO=y"
+                artifact = urchinctl.build_one(repo, entry, False)
+                config.joinpath("urchin.conf").write_text("# CONFIG_ZMK_SLEEP is not set\n")
+                urchinctl.build_one(repo, entry, False)
+
+            self.assertEqual([command[command.index("-p") + 1] for command in commands], ["always", "auto", "always", "always"])
+            self.assertEqual(artifact.read_bytes(), b"no proxy")
+
+    def test_rejects_mismatched_compiled_option(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "cache" / "urchin-manager" / "workspace"
+
+            def fake_run(_command):
+                config_dir = workspace / "build" / "left" / "zephyr"
+                config_dir.mkdir(parents=True, exist_ok=True)
+                config_dir.joinpath(".config").write_text("# CONFIG_ZMK_STUDIO is not set\n")
+                config_dir.joinpath("zmk.uf2").write_bytes(b"stale")
+
+            entry = {"board": "nice_nano_v2", "shield": "urchin_left", "cmake-args": "-DCONFIG_ZMK_STUDIO=y"}
+            with patch.object(urchinctl, "CACHE_HOME", root / "cache" / "urchin-manager"), \
+                 patch.object(urchinctl, "STATE_HOME", root / "state" / "urchin-manager"), \
+                 patch.object(urchinctl, "docker_ready", return_value=(True, "ready")), \
+                 patch.object(urchinctl, "prepare_workspace"), \
+                 patch.object(urchinctl, "run_stream", side_effect=fake_run):
+                with self.assertRaisesRegex(urchinctl.UrchinError, "was not applied"):
+                    urchinctl.build_one(root, entry, False)
+            self.assertFalse((root / "state" / "urchin-manager" / "artifacts").exists())
+
+
+class BluetoothRecoveryTests(unittest.TestCase):
+    def test_forget_refuses_an_unrelated_device(self):
+        result = urchinctl.subprocess.CompletedProcess(
+            [], 0, "Device AA:BB:CC:DD:EE:FF\n Name: headphones\n Paired: yes\n", ""
+        )
+        with patch.object(urchinctl.subprocess, "run", return_value=result) as run:
+            with self.assertRaisesRegex(urchinctl.UrchinError, "not named Urchin"):
+                urchinctl.forget_paired_urchin("AA:BB:CC:DD:EE:FF")
+        self.assertEqual(run.call_count, 1)
+
+    def test_forget_only_selected_paired_urchin(self):
+        info = urchinctl.subprocess.CompletedProcess(
+            [], 0, "Device AA:BB:CC:DD:EE:FF\n Name: urchin\n Paired: yes\n", ""
+        )
+        removed = urchinctl.subprocess.CompletedProcess([], 0, "Device removed", "")
+        absent = urchinctl.subprocess.CompletedProcess([], 1, "", "Device not available")
+        with patch.object(urchinctl.subprocess, "run", side_effect=[info, removed, absent]) as run:
+            urchinctl.forget_paired_urchin("AA:BB:CC:DD:EE:FF")
+        self.assertEqual(run.call_args_list[1].args[0], ["bluetoothctl", "remove", "AA:BB:CC:DD:EE:FF"])
 
 
 if __name__ == "__main__":

@@ -11,7 +11,12 @@ keyboard running ZMK.
 - Builds left, right, or settings-reset UF2 firmware locally in the official
   ZMK Docker image.
 - Keeps the ZMK checkout and build directories cached for incremental builds.
+- Starts a clean build when board, shield, snippet, toolchain image, CMake
+  options, or ZMK `.conf`/`.overlay` files change, and checks that requested
+  `CONFIG_...=y/n` options reached the compiled firmware.
 - Waits for a mounted `NICENANO` bootloader and flashes the selected artifact.
+- Guides Bluetooth pairing recovery after a left flash and can forget a selected
+  paired Urchin on this computer.
 - Opens ZMK Studio for temporary live experiments.
 - Shows the live left-half battery percentage when hovering over the bar icon.
   When firmware exposes the split peripheral battery proxy, the tooltip shows
@@ -59,10 +64,16 @@ bin/urchinctl battery
 bin/urchinctl build left
 bin/urchinctl build all
 bin/urchinctl flash left
+bin/urchinctl forget-host AA:BB:CC:DD:EE:FF
 ```
 
 The tested official image is pinned by digest. Set `URCHIN_ZMK_IMAGE` to
 override it when deliberately upgrading the toolchain.
+
+The first build after a change to build options is clean. Keymap edits can
+still use the cached incremental build. A build fails rather than saving a UF2
+if an explicitly requested `CONFIG_...=y/n` option is absent from the compiled
+configuration.
 
 ## Flashing
 
@@ -78,6 +89,23 @@ bin/urchinctl flash reset
 
 Follow the normal ZMK split-keyboard reset sequence; both halves lose their
 pairing data and must be reset and reflashed appropriately.
+
+## Bluetooth recovery
+
+The panel opens **Bluetooth recovery** after a successful left flash. Use it
+if Bluetooth repeatedly connects and disconnects, or if media keys work over
+USB but not Bluetooth:
+
+1. Unplug the left half from USB.
+2. Click **Forget urchin on this computer** for the paired device you intend
+   to replace. This only removes the computer's pairing record.
+3. On the keyboard, press both left thumb keys together, then R (`BT_CLR`) to
+   clear its active host profile.
+4. Pair again in Omarchy Bluetooth.
+
+The forget button only accepts an already paired device named Urchin. Pairing
+recovery is optional after an ordinary keymap flash; it is useful when firmware
+changes Bluetooth services or the connection misbehaves.
 
 ## ZMK Studio
 

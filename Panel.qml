@@ -29,7 +29,7 @@ Panel {
   readonly property string layoutPath: String(setting("layoutPath", "config/urchin.json"))
   readonly property string cliPath: decodeURIComponent(String(Qt.resolvedUrl("bin/urchinctl")).replace("file://", ""))
 
-  property var state: ({ ok: false, layers: [], layout: [], artifacts: [], errors: [] })
+  property var state: ({ ok: false, layers: [], layout: [], artifacts: [], pairedUrchins: [], errors: [] })
   property int selectedLayer: 0
   property int selectedKey: -1
   property string notice: ""
@@ -37,6 +37,7 @@ Panel {
   property string logText: ""
   property string diffText: ""
   property string runningAction: ""
+  property bool showBluetoothHelp: false
 
   readonly property var currentLayer: state.layers && state.layers.length > selectedLayer
     ? state.layers[selectedLayer] : null
@@ -255,6 +256,7 @@ Panel {
     }
     onExited: function(exitCode) {
       if (exitCode !== 0) root.error = root.runningAction + " failed. See the log below."
+      if (exitCode === 0 && root.runningAction === "Flash left") root.showBluetoothHelp = true
       root.runningAction = ""
       root.refresh()
     }
@@ -481,6 +483,63 @@ Panel {
             Button {
               text: "Open source"
               onClicked: Quickshell.execDetached(["xdg-open", root.repoPath])
+            }
+          }
+
+          Button {
+            text: root.showBluetoothHelp ? "Hide Bluetooth recovery" : "Bluetooth recovery"
+            onClicked: root.showBluetoothHelp = !root.showBluetoothHelp
+          }
+
+          BorderSurface {
+            visible: root.showBluetoothHelp
+            width: parent.width
+            height: recoveryColumn.implicitHeight + Style.space(20)
+            color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.04)
+            borderSpec: Border.controlSpec("normal", root.foreground, root.accent)
+            radius: Style.cornerRadius
+            padding: Style.space(10)
+
+            Column {
+              id: recoveryColumn
+              width: parent.width
+              spacing: Style.space(8)
+
+              Text {
+                width: parent.width
+                text: "If Bluetooth loops or media keys stop after a left flash:"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                wrapMode: Text.Wrap
+              }
+              Text {
+                width: parent.width
+                text: "1. Unplug the left half from USB. 2. Forget its pairing on this computer. 3. Press both left thumb keys together, then R, to clear the keyboard's active host profile. 4. Pair again in Omarchy Bluetooth."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                wrapMode: Text.Wrap
+              }
+              Repeater {
+                model: root.state.pairedUrchins || []
+                Button {
+                  required property var modelData
+                  text: "Forget " + modelData.name + " on this computer"
+                  tooltipText: "Remove only this host's pairing for " + modelData.address
+                  enabled: !actionProc.running
+                  onClicked: root.runAction("Forget Urchin", ["forget-host", modelData.address])
+                }
+              }
+              Text {
+                visible: !root.state.pairedUrchins || root.state.pairedUrchins.length === 0
+                width: parent.width
+                text: "No paired Urchin is currently saved on this computer."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.Wrap
+              }
             }
           }
 

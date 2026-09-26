@@ -371,6 +371,52 @@ def docker_ready() -> tuple[bool, str]:
     return True, proc.stdout.strip()
 
 
+def paired_urchins() -> list[dict[str, str]]:
+    if not shutil.which("bluetoothctl"):
+        return []
+    try:
+        proc = subprocess.run(
+            ["bluetoothctl", "devices", "Paired"],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if proc.returncode != 0:
+        return []
+    devices = []
+    for line in proc.stdout.splitlines():
+        match = re.fullmatch(r"Device ([0-9A-Fa-f:]{17}) (.+)", line.strip())
+        if match and "urchin" in match.group(2).casefold():
+            devices.append({"address": match.group(1).upper(), "name": match.group(2)})
+    return devices
+
+
+def forget_paired_urchin(address: str) -> None:
+    if not re.fullmatch(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}", address):
+        raise UrchinError("Invalid Bluetooth address")
+    info = subprocess.run(
+        ["bluetoothctl", "info", address],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5,
+    )
+    if info.returncode != 0 or not re.search(r"^\s*Paired: yes$", info.stdout, re.MULTILINE):
+        raise UrchinError("That Bluetooth device is not paired on this computer")
+    name = re.search(r"^\s*(?:Name|Alias): (.+)$", info.stdout, re.MULTILINE)
+    if not name or "urchin" not in name.group(1).casefold():
+        raise UrchinError("Refusing to forget a device that is not named Urchin")
+    removed = subprocess.run(
+        ["bluetoothctl", "remove", address],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
+    )
+    if removed.returncode != 0:
+        raise UrchinError(removed.stderr.strip() or "Could not forget the Urchin")
+    remaining = subprocess.run(
+        ["bluetoothctl", "info", address],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5,
+    )
+    if remaining.returncode == 0 and re.search(r"^\s*Paired: yes$", remaining.stdout, re.MULTILINE):
+        raise UrchinError("The Urchin is still paired on this computer")
+
+
 def snapshot(repo: Path, keymap_rel: Path, layout_rel: Path) -> dict[str, Any]:
     keymap = safe_repo_path(repo, keymap_rel)
     layout = safe_repo_path(repo, layout_rel)
@@ -403,6 +449,7 @@ def snapshot(repo: Path, keymap_rel: Path, layout_rel: Path) -> dict[str, Any]:
         "branch": branch,
         "dirty": dirty,
         "docker": {"ready": ready, "detail": docker_detail},
+        "pairedUrchins": paired_urchins(),
         "layers": layers,
         "layout": positions,
         "artifacts": latest_artifacts(),
@@ -488,8 +535,7 @@ def docker_command(workspace: Path, args: list[str]) -> list[str]:
 
 def manifest_digest(repo: Path) -> str:
     digest = hashlib.sha256()
-    for relative in (Path("config/west.yml"), Path("build.yaml")):
-        digest.update(safe_repo_path(repo, relative).read_bytes())
+    digest.update(safe_repo_path(repo, Path("config/west.yml")).read_bytes())
     return digest.hexdigest()
 
 
@@ -518,7 +564,24 @@ def build_one(repo: Path, entry: dict[str, str], force_update: bool) -> Path:
     prepare_workspace(repo, workspace, force_update)
     name = target_name(entry)
     build_dir = f"build/{name}"
-    args = ["west", "build", "-p", "auto", "-s", "zmk/app", "-d", build_dir, "-b", entry["board"]]
+    signature_data = {
+        "board": entry["board"], "shield": entry.get("shield", ""),
+        "snippet": entry.get("snippet", ""), "cmake-args": entry.get("cmake-args", ""),
+        "image": os.environ.get("URCHIN_ZMK_IMAGE", DEFAULT_IMAGE),
+    }
+    config_files = sorted(
+        path for path in (repo / "config").rglob("*")
+        if path.is_file() and path.suffix in (".conf", ".overlay", ".yml")
+    )
+    signature_data["config-files"] = {
+        str(path.relative_to(repo)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in config_files
+    }
+    signature = hashlib.sha256(json.dumps(signature_data, sort_keys=True).encode()).hexdigest()
+    signature_path = workspace / ".urchin-build-signatures" / f"{name}.sha256"
+    previous_signature = signature_path.read_text().strip() if signature_path.exists() else ""
+    pristine = force_update or previous_signature != signature
+    args = ["west", "build", "-p", "always" if pristine else "auto", "-s", "zmk/app", "-d", build_dir, "-b", entry["board"]]
     snippet = entry.get("snippet", "")
     if snippet:
         args.extend(["-S", snippet])
@@ -527,11 +590,22 @@ def build_one(repo: Path, entry: dict[str, str], force_update: bool) -> Path:
         cmake.append(f"-DSHIELD={entry['shield']}")
     if entry.get("cmake-args"):
         cmake.extend(entry["cmake-args"].split())
-    print(f"[build] Building {name}", flush=True)
+    print(f"[build] Building {name}" + (" with a clean configuration" if pristine else " incrementally"), flush=True)
     run_stream(docker_command(workspace, args + cmake))
     source = workspace / build_dir / "zephyr" / "zmk.uf2"
     if not source.exists():
         raise UrchinError(f"Build completed without producing {source}")
+    config = (workspace / build_dir / "zephyr" / ".config").read_text(encoding="utf-8")
+    config_lines = set(config.splitlines())
+    for option in cmake:
+        match = re.fullmatch(r"-D(CONFIG_[A-Z0-9_]+)=(y|n)", option)
+        if match:
+            symbol, value = match.groups()
+            expected = f"{symbol}=y" if value == "y" else f"# {symbol} is not set"
+            if expected not in config_lines:
+                raise UrchinError(f"Build setting {symbol}={value} was not applied; no UF2 was saved")
+    signature_path.parent.mkdir(parents=True, exist_ok=True)
+    signature_path.write_text(signature, encoding="utf-8")
     STATE_HOME.joinpath("artifacts").mkdir(parents=True, exist_ok=True)
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     destination = STATE_HOME / "artifacts" / f"urchin-{name}-{stamp}.uf2"
@@ -632,6 +706,12 @@ def command_flash(args: argparse.Namespace) -> None:
     print("URCHIN_RESULT:" + json.dumps({"ok": True, "artifact": str(artifact), "mount": str(mount)}), flush=True)
 
 
+def command_forget_host(args: argparse.Namespace) -> None:
+    forget_paired_urchin(args.address)
+    print("[done] Removed Urchin pairing from this computer", flush=True)
+    print("URCHIN_RESULT:" + json.dumps({"ok": True, "address": args.address}), flush=True)
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(prog="urchinctl", description="Manage an Urchin ZMK keyboard locally")
     result.add_argument("--repo", type=Path, default=Path(os.environ.get("URCHIN_ZMK_REPO", DEFAULT_REPO)))
@@ -658,6 +738,9 @@ def parser() -> argparse.ArgumentParser:
     flash_cmd.add_argument("target", choices=("left", "right", "reset"))
     flash_cmd.add_argument("--timeout", type=int, default=60)
     flash_cmd.set_defaults(func=command_flash)
+    forget_cmd = sub.add_parser("forget-host", help="Forget a paired Urchin on this computer")
+    forget_cmd.add_argument("address")
+    forget_cmd.set_defaults(func=command_forget_host)
     return result
 
 
