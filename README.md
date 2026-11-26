@@ -28,14 +28,14 @@ or pushes automatically.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/kcodedev/urchin-omarchy-plugin.git --enable
+omarchy plugin add https://github.com/kcodedev/omarchy-plugin-urchin.git --enable
 ```
 
 For local development, link the checkout into the user plugin directory and
 rescan the shell:
 
 ```bash
-ln -s /absolute/path/to/urchin-omarchy-plugin \
+ln -s /absolute/path/to/omarchy-plugin-urchin \
   ~/.config/omarchy/plugins/kcodedev.urchin
 omarchy-shell shell rescanPlugins
 omarchy plugin enable kcodedev.urchin --section right
